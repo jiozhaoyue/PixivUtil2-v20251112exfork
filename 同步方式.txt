@@ -1,0 +1,51 @@
+Ran terminal command: cd f:\GitHub ; git clone https://github.com/jiozhaoyue/PixivUtil2-ignored-private.git PixivUtil2-ignored-private-clone
+
+Ran terminal command: Copy-Item "PixivUtil2-ignored-private-clone\*" "PixivUtil2v20251112exfork\" -Recurse -Force
+
+复制完成！现在您的私密文件已从私有仓库拉取并放置到项目文件夹中。
+
+### 在另一台电脑上的完整步骤：
+1. **安装Git**（如果尚未安装）：下载并安装Git（https://git-scm.com/）。
+
+2. **克隆私有仓库**：
+   - 打开终端（PowerShell或CMD）。
+   - 导航到您想要放置仓库的目录，例如 `cd C:\GitHub` 或类似。
+   - 运行：
+     ```
+     git clone https://github.com/jiozhaoyue/PixivUtil2-ignored-private.git
+     ```
+   - 如果提示输入用户名和密码，使用您的GitHub用户名和个人访问令牌（PAT）。如果启用2FA，必须使用PAT而不是密码。
+     - 创建PAT：在GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token。
+     - 权限：至少需要 `repo` 权限。
+
+3. **复制文件到项目文件夹**：
+   - 假设您的PixivUtil2项目在 `C:\Path\To\PixivUtil2v20251112exfork`。
+   - 运行：
+     ```
+     Copy-Item "D:\Github\PixivUtil2-v20251112exfork\PixivUtil2-ignored-private\*" "D:\Github\PixivUtil2-v20251112exfork" -Recurse -Force
+     ```
+   - 这会将所有文件复制到项目文件夹，覆盖现有文件。
+
+4. **可选：设置SSH密钥**（更安全，无需每次输入凭据）：
+   - 生成SSH密钥：`ssh-keygen -t ed25519 -C "your_email@example.com"`
+   - 添加到GitHub：复制 `~/.ssh/id_ed25519.pub` 的内容到GitHub → Settings → SSH and GPG keys。
+   - 克隆时使用SSH URL：`git clone git@github.com:jiozhaoyue/PixivUtil2-ignored-private.git`
+
+### 注意事项：
+- **私密性**：私有仓库确保只有您能访问。
+- **更新**：如果私有仓库有更新，在另一台电脑上运行 `git pull` 来获取最新文件，然后再次复制。
+- **自动化**：可以编写批处理脚本或PowerShell脚本来自动化克隆和复制过程。
+
+如果在另一台电脑上遇到问题，请提供错误信息，我可以进一步帮助！   - 这会将所有文件复制到项目文件夹，覆盖现有文件。
+
+4. **可选：设置SSH密钥**（更安全，无需每次输入凭据）：
+   - 生成SSH密钥：`ssh-keygen -t ed25519 -C "your_email@example.com"`
+   - 添加到GitHub：复制 `~/.ssh/id_ed25519.pub` 的内容到GitHub → Settings → SSH and GPG keys。
+   - 克隆时使用SSH URL：`git clone git@github.com:jiozhaoyue/PixivUtil2-ignored-private.git`
+
+### 注意事项：
+- **私密性**：私有仓库确保只有您能访问。
+- **更新**：如果私有仓库有更新，在另一台电脑上运行 `git pull` 来获取最新文件，然后再次复制。
+- **自动化**：可以编写批处理脚本或PowerShell脚本来自动化克隆和复制过程。
+
+如果在另一台电脑上遇到问题，请提供错误信息，我可以进一步帮助！

@@ -1,0 +1,1155 @@
+import os
+import sys
+from datetime import time
+import json
+import re
+
+import handler.PixivArtistHandler as PixivArtistHandler
+import common.PixivConstant as PixivConstant
+import handler.PixivDownloadHandler as PixivDownloadHandler
+import common.PixivHelper as PixivHelper
+import handler.PixivImageHandler as PixivImageHandler
+from model.PixivBookmark import PixivBookmark
+from common.PixivBrowserFactory import PixivBrowser
+from model.PixivGroup import PixivGroup
+from model.PixivListItem import PixivListItem
+from common.PixivException import PixivException
+
+
+# NOTE: preheat 断点续传 helper（必须定义在 preheat_followed_members 之前）
+def _load_preheat_progress(progress_file):
+    try:
+        if progress_file and os.path.exists(progress_file) and os.path.getsize(progress_file) > 0:
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_preheat_progress(progress_file, data):
+    if not progress_file:
+        return
+    tmp = progress_file + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, progress_file)
+
+
+def _unique_by_member_id(items):
+    """去除重复的 memberId（保留首次出现的顺序）。"""
+    seen = set()
+    out = []
+    for it in items:
+        mid = str(getattr(it, 'memberId', ''))
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(it)
+    return out
+
+
+def _sort_followed_members(caller, config, members):
+    """根据 config.memberOrder 对关注作者列表排序。
+
+    order 支持：
+    - default/none: 不排序
+    - fewest_first: total_images 从小到大（缺失时回退到已入库计数）
+    - most_first: total_images 从大到小（缺失时回退到已入库计数）
+    """
+    order = (getattr(config, 'memberOrder', '') or '').strip().lower()
+    if order in ('', 'default', 'none'):
+        return members
+
+    db = caller.__dbManager__
+    member_ids = [int(m.memberId) for m in members if getattr(m, 'memberId', None) is not None]
+
+    total_map = {}
+    try:
+        if hasattr(db, 'selectMemberTotalImagesMap'):
+            total_map = db.selectMemberTotalImagesMap(member_ids)
+    except Exception as ex:
+        PixivHelper.print_and_log('warn', f'memberOrder: failed to load total_images from DB, will fallback. err={ex}')
+        total_map = {}
+
+    # fallback：已入库作品数（不是全量，仅兜底）
+    def _fallback_count(mid: int) -> int:
+        try:
+            # 尽量兼容不同版本 DBManager
+            if hasattr(db, 'countImageByMemberId'):
+                return int(db.countImageByMemberId(mid))
+            if hasattr(db, 'selectImageCountByMemberId'):
+                return int(db.selectImageCountByMemberId(mid))
+        except Exception:
+            pass
+        return 0
+
+    missing = 0
+    key_map = {}
+    for mid in member_ids:
+        v = total_map.get(mid)
+        if v is None:
+            missing += 1
+            v = _fallback_count(mid)
+        key_map[mid] = int(v)
+
+    PixivHelper.print_and_log('info', f'memberOrder={order}: using total_images for {len(member_ids) - missing}/{len(member_ids)} members; fallback for {missing}.')
+
+    reverse = order in ('most_first', 'most', 'desc', 'largest_first')
+    return sorted(members, key=lambda x: key_map.get(int(x.memberId), 0), reverse=reverse)
+
+
+def process_bookmark(caller,
+                     config,
+                     hide='n',
+                     start_page=1,
+                     end_page=0,
+                     bookmark_count=-1):
+    br: PixivBrowser = caller.__br__
+
+    try:
+        total_list = list()
+        
+        # Check if we should load from local file first (NEW: menu5UseLocalList config)
+        use_local_list = getattr(config, 'menu5UseLocalList', True)
+        list_file = getattr(config, 'followedArtistListFile', 'followed_artists.txt')
+        
+        if use_local_list and list_file and os.path.exists(list_file) and os.path.getsize(list_file) > 0:
+            # Load from local file instead of fetching from network
+            PixivHelper.print_and_log('info', f"Loading followed artists from local file: {list_file}")
+            try:
+                total_list = PixivListItem.parseList(list_file, config.rootDirectory)
+                PixivHelper.print_and_log('info', f"Loaded {len(total_list)} members from local file.")
+            except Exception as ex:
+                PixivHelper.print_and_log('warn', f"Failed to load from local file, falling back to network: {ex}")
+                total_list = list()
+        
+        # If no members loaded from file, fetch from network
+        if len(total_list) == 0:
+            print(f"My Member Id = {br._myId}")
+            if hide != 'o':
+                print("Importing Bookmarks from network...")
+                total_list.extend(get_bookmarks(caller, config, False, start_page, end_page, br._myId))
+            if hide != 'n':
+                print("Importing Private Bookmarks from network...")
+                total_list.extend(get_bookmarks(caller, config, True, start_page, end_page, br._myId))
+
+        # 去重 + 按配置排序（修复：不再仅按作者列表原顺序处理）
+        total_list = _unique_by_member_id(total_list)
+        total_list = _sort_followed_members(caller, config, total_list)
+
+        print(f"Result: {str(len(total_list))} items.")
+        i = 0
+        current_member = 1
+        for item in total_list:
+            print("%d/%d\t%f %%" % (i, len(total_list), 100.0 * i / float(len(total_list))))
+            i += 1
+            prefix = "[{0} of {1}]".format(current_member, len(total_list))
+
+            if str(item.memberId) in caller.__blacklistMembers:
+                PixivHelper.print_and_log('warn', f'Skipping member id: {item.memberId} by blacklist_members.txt.')
+            else:
+                PixivArtistHandler.process_member(caller,
+                                                  config,
+                                                  item.memberId,
+                                                  user_dir='',
+                                                  title_prefix=prefix,
+                                                  bookmark_count=bookmark_count)
+
+            current_member = current_member + 1
+
+        if len(total_list) > 0:
+            print("%d/%d\t%f %%" % (i, len(total_list), 100.0 * i / float(len(total_list))))
+        else:
+            print("Cannot find any followed member.")
+        
+        # 下载完成后自动标记（如启用）
+        if len(total_list) > 0:
+            try:
+                _auto_mark_completed_members_after_download(caller, config, total_list)
+            except Exception as ex:
+                PixivHelper.print_and_log('warn', f'Error during auto-mark: {ex}')
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at process_bookmark(): {0}'.format(sys.exc_info()))
+        raise
+
+
+def process_image_bookmark(caller,
+                           config,
+                           hide='n',
+                           start_page=1,
+                           end_page=0,
+                           tag=None,
+                           use_image_tag=False):
+    try:
+        print("Importing image bookmarks...")
+        totalList = list()
+        private_list = list()
+        public_list = list()
+        image_count = 1
+        total_bookmark_count = 0
+
+        if hide == 'n':
+            (public_list, total_bookmark_count) = get_image_bookmark(caller, config, False, start_page, end_page, tag, use_image_tag)
+        elif hide == 'y':
+            # public and private image bookmarks
+            (public_list, total_bookmark_count_pub) = get_image_bookmark(caller, config, False, start_page, end_page, tag, use_image_tag)
+            (private_list, total_bookmark_count_priv) = get_image_bookmark(caller, config, True, start_page, end_page, tag, use_image_tag)
+            total_bookmark_count = total_bookmark_count_pub + total_bookmark_count_priv
+        else:
+            (private_list, total_bookmark_count) = get_image_bookmark(caller, config, True, start_page, end_page, tag, use_image_tag)
+        totalList.extend(private_list)
+        totalList.extend(public_list)
+
+        PixivHelper.print_and_log('info', f"Found {len(totalList)} of {total_bookmark_count} possible image(s) .")
+        for item in totalList:
+            print(f"Image # {image_count}")
+            result = PixivImageHandler.process_image(caller,
+                                                     config,
+                                                     artist=None,
+                                                     image_id=item,
+                                                     search_tags=tag)
+            image_count = image_count + 1
+            PixivHelper.wait(result, config)
+
+        print("Done.\n")
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at process_image_bookmark(): {0}'.format(sys.exc_info()))
+        raise
+
+
+def process_new_illust_from_bookmark(caller,
+                                     config,
+                                     page_num=1,
+                                     end_page_num=0,
+                                     bookmark_count=-1):
+    br: PixivBrowser = caller.__br__
+    parsed_page = None
+    try:
+        print("Processing New Illust from bookmark")
+        i = page_num
+        image_count = 1
+        flag = True
+        while flag:
+            print(f"Page #{i}")
+            mode = "all"
+            if config.r18mode:
+                mode = "r18"
+            pb = br.getFollowedNewIllusts(mode, current_page=i)
+
+            for image_id in pb.imageList:
+                print(f"Image #{image_count}")
+                result = PixivImageHandler.process_image(caller,
+                                                         config,
+                                                         artist=None,
+                                                         image_id=int(image_id),
+                                                         bookmark_count=bookmark_count)
+                image_count = image_count + 1
+
+                if result == PixivConstant.PIXIVUTIL_SKIP_OLDER:
+                    flag = False
+                    break
+
+                PixivHelper.wait(result, config)
+            i = i + 1
+
+            # page.close()
+            # parsed_page.decompose()
+            # del parsed_page
+
+            if (end_page_num != 0 and i > end_page_num) or pb.isLastPage:
+                print("Limit or last page reached.")
+                flag = False
+
+        print("Done.")
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at process_new_illust_from_bookmark(): {0}'.format(sys.exc_info()))
+        if parsed_page is not None:
+            filename = "Dump for New Illust from bookmark.html"
+            PixivHelper.dump_html(filename, parsed_page)
+        raise
+
+
+def process_from_group(caller,
+                       config,
+                       group_id,
+                       limit=0,
+                       process_external=True):
+    br: PixivBrowser = caller.__br__
+    json_response = None
+    try:
+        print("Download by Group Id")
+        if limit != 0:
+            print(f"Limit: {limit}")
+        if process_external:
+            print(f"Include External Image: {process_external}")
+
+        max_id = 0
+        image_count = 0
+        flag = True
+        while flag:
+            url = f"https://www.pixiv.net/group/images.php?format=json&max_id={max_id}&id={group_id}"
+            PixivHelper.print_and_log('info', f"Getting images from: {url}")
+            response = br.open(url)
+            json_response = response.read()
+            response.close()
+            group_data = PixivGroup(json_response)
+            max_id = group_data.maxId
+            if group_data.imageList is not None and len(group_data.imageList) > 0:
+                for image in group_data.imageList:
+                    if image_count > limit and limit != 0:
+                        flag = False
+                        break
+                    print(f"Image #{image_count}")
+                    print(f"ImageId: {image}")
+                    result = PixivImageHandler.process_image(caller,
+                                                             config,
+                                                             image_id=image)
+                    image_count = image_count + 1
+                    PixivHelper.wait(result, config)
+
+            if process_external and group_data.externalImageList is not None and len(group_data.externalImageList) > 0:
+                for image_data in group_data.externalImageList:
+                    if image_count > limit and limit != 0:
+                        flag = False
+                        break
+                    print(f"Image #{image_count}")
+                    print(f"Member Id    : {image_data.artist.artistId}")
+                    PixivHelper.safePrint(f"Member Name  : {image_data.artist.artistName}")
+                    print(f"Member Token : {image_data.artist.artistToken}")
+                    print(f"Image Url    : {image_data.imageUrls[0]}")
+
+                    filename = PixivHelper.make_filename(config.filenameFormat,
+                                                         imageInfo=image_data,
+                                                         tagsSeparator=config.tagsSeparator,
+                                                         tagsLimit=config.tagsLimit,
+                                                         fileUrl=image_data.imageUrls[0],
+                                                         useTranslatedTag=config.useTranslatedTag,
+                                                         tagTranslationLocale=config.tagTranslationLocale)
+                    filename = PixivHelper.sanitize_filename(filename, config.rootDirectory)
+                    PixivHelper.safePrint(f"Filename  : {filename}")
+                    (result, filename) = PixivDownloadHandler.download_image(caller,
+                                                                             image_data.imageUrls[0],
+                                                                             filename,
+                                                                             url,
+                                                                             config.overwrite,
+                                                                             config.retry,
+                                                                             backup_old_file=config.backupOldFile)
+                    PixivHelper.get_logger().debug("Download %s result: %s", filename, result)
+                    if config.setLastModified and filename is not None and os.path.isfile(filename):
+                        ts = time.mktime(image_data.worksDateDateTime.timetuple())
+                        os.utime(filename, (ts, ts))
+
+                    image_count = image_count + 1
+
+            if (group_data.imageList is None or len(group_data.imageList) == 0) and \
+               (group_data.externalImageList is None or len(group_data.externalImageList) == 0):
+                flag = False
+            print("")
+
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at process_from_group(): {0}'.format(sys.exc_info()))
+        if json_response is not None:
+            filename = f"Dump for Download by Group {group_id}.json"
+            PixivHelper.dump_html(filename, json_response)
+        raise
+
+
+def export_bookmark(caller,
+                    config,
+                    filename,
+                    hide='n',
+                    start_page=1,
+                    end_page=0,
+                    member_id=None):
+    try:
+        total_list = list()
+        if hide != 'o':
+            print("Importing Bookmarks...")
+            total_list.extend(get_bookmarks(caller, config, False, start_page, end_page, member_id))
+        if hide != 'n':
+            print("Importing Private Bookmarks...")
+            total_list.extend(get_bookmarks(caller, config, True, start_page, end_page, member_id))
+        print(f"Result: {len(total_list)} items.")
+        PixivBookmark.exportList(total_list, filename)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at export_bookmark(): {0}'.format(sys.exc_info()))
+        raise
+
+
+def export_image_bookmark(caller,
+                          config,
+                          hide='n',
+                          start_page=1,
+                          end_page=0,
+                          tag=None,
+                          use_image_tag=False,
+                          filename='exported_images.txt'):
+    try:
+        print("Getting image bookmarks...")
+        total_list = list()
+        private_list = list()
+        public_list = list()
+        total_bookmark_count = 0
+
+        if hide == 'n':
+            (public_list, total_bookmark_count) = get_image_bookmark(caller, config, False, start_page, end_page, tag, use_image_tag)
+        elif hide == 'y':
+            # public and private image bookmarks
+            (public_list, total_bookmark_count_pub) = get_image_bookmark(caller, config, False, start_page, end_page, tag, use_image_tag)
+            (private_list, total_bookmark_count_priv) = get_image_bookmark(caller, config, True, start_page, end_page, tag, use_image_tag)
+            total_bookmark_count = total_bookmark_count_pub + total_bookmark_count_priv
+        else:
+            (private_list, total_bookmark_count) = get_image_bookmark(caller, config, True, start_page, end_page, tag, use_image_tag)
+        total_list.extend(private_list)
+        total_list.extend(public_list)
+
+        PixivBookmark.export_image_list(total_list, filename)
+
+        PixivHelper.print_and_log('info', f"Found {len(total_list)} of {total_bookmark_count} possible image(s) .")
+
+        print("Done.\n")
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at export_image_bookmark(): {0}'.format(sys.exc_info()))
+        raise
+
+
+def export_image_table(caller, filename, pixiv, fanbox, sketch):
+    export_list = list()
+    table = list()
+    try:
+        if pixiv == 'o':
+            table.append("Pixiv")
+        elif fanbox == 'o':
+            table.append("Fanbox")
+        elif sketch == 'o':
+            table.append("Sketch")
+        else:
+            if pixiv == 'y':
+                table.append("Pixiv")
+            if fanbox == 'y':
+                table.append("Fanbox")
+            if sketch == 'y':
+                table.append("Sketch")
+        for t in table:
+            export_list = caller.__dbManager__.exportImageTable(t)
+            PixivBookmark.export_image_list(export_list, f"{filename}-{t}")
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', 'Error at export_image_table(): {0}'.format(sys.exc_info()))
+        raise
+
+
+def get_bookmarks(caller, config, hide, start_page=1, end_page=0, member_id=None):
+    br: PixivBrowser = caller.__br__
+
+    """Get User's bookmarked artists """
+    total_list = list()
+    i = start_page
+    limit = 48
+    offset = 0
+    is_json = False
+    locale = "&lang=en"
+    if br._locale is not None and len(br._locale) > 0:
+        locale = f"&lang={br._locale}"
+
+    while True:
+        if end_page != 0 and i > end_page:
+            print('Limit reached')
+            break
+        PixivHelper.print_and_log('info', f'Exporting page {i}')
+        if member_id:
+            is_json = True
+            offset = limit * (i - 1)
+            url = f'https://www.pixiv.net/ajax/user/{member_id}/following?offset={offset}&limit={limit}'
+        else:
+            # Issue #942
+            member_id = br._myId
+            is_json = True
+            url = f'https://www.pixiv.net/ajax/user/{member_id}/following?offset={offset}&limit={limit}'
+        if hide:
+            url = url + "&rest=hide"
+        else:
+            url = url + "&rest=show"
+        url = url + locale
+
+        PixivHelper.print_and_log('info', f"Source URL: {url}")
+
+        page = br.open_with_retry(url)
+        page_str = page.read().decode('utf8')
+        page.close()
+
+        bookmarks = PixivBookmark.parseBookmark(page_str,
+                                                root_directory=config.rootDirectory,
+                                                db_path=config.dbPath,
+                                                locale=br._locale,
+                                                is_json=is_json)
+
+        if len(bookmarks) == 0:
+            print('No more data')
+            break
+        total_list.extend(bookmarks)
+        i = i + 1
+        print(str(len(bookmarks)), 'items')
+        PixivHelper.wait(config=config)
+    return total_list
+
+
+def get_image_bookmark(caller, config, hide, start_page=1, end_page=0, tag=None, use_image_tag=False):
+    """Get user's image bookmark"""
+    br: PixivBrowser = caller.__br__
+    total_list = list()
+    i = start_page
+    offset = 0
+    limit = 48
+    member_id = br._myId
+    total_bookmark_count = 0
+    encoded_tag = ''
+
+    while True:
+        if end_page != 0 and i > end_page:
+            print(f"Page Limit reached: {end_page}")
+            break
+
+        # https://www.pixiv.net/ajax/user/189816/illusts/bookmarks?tag=&offset=0&limit=48&rest=show
+        show = "show"
+        if hide:
+            show = "hide"
+
+        if tag is not None and len(tag) > 0:
+            encoded_tag = PixivHelper.encode_tags(tag)
+        offset = limit * (i - 1)
+        PixivHelper.print_and_log('info', f"Importing user's bookmarked image from page {i}")
+
+        url = f"https://www.pixiv.net/ajax/user/{member_id}/illusts/bookmarks?tag={encoded_tag}&offset={offset}&limit={limit}&rest={show}"
+        if use_image_tag:  # don't filter based on user's bookmark tag
+            url = f"https://www.pixiv.net/ajax/user/{member_id}/illusts/bookmarks?tag=&offset={offset}&limit={limit}&rest={show}"
+            PixivHelper.print_and_log('info', f"Using image tag: {tag}")
+
+        PixivHelper.print_and_log('info', f"Source URL: {url}")
+        page = br.open(url)
+        page_str = page.read().decode('utf8')
+        page.close()
+
+        if use_image_tag:
+            (bookmarks, total_bookmark_count) = PixivBookmark.parseImageBookmark(page_str, image_tags_filter=tag)
+        else:
+            (bookmarks, total_bookmark_count) = PixivBookmark.parseImageBookmark(page_str)
+
+        total_list.extend(bookmarks)
+        if len(bookmarks) == 0 and not use_image_tag:
+            print("No more images.")
+            break
+        elif use_image_tag and total_bookmark_count / limit < i:
+            print("Last page reached.")
+            break
+        else:
+            print(f" found {len(bookmarks)} images.")
+
+        i = i + 1
+
+        # Issue#569
+        PixivHelper.wait(config=config)
+
+    return (total_list, total_bookmark_count)
+
+
+def preheat_followed_members(caller, config, list_file=None, hide='n', delay_seconds=0.5,
+                            progress_file=None, resume=True, flush_every=10, reset_progress=False):
+    """遍历关注列表，仅获取作者主页以读取 artist.totalImages，并写回 DB 的 total_images 字段。
+
+    断点续传：
+    - progress_file: 进度文件（默认: <list_file>.preheat_progress.json）
+    - resume: True 时跳过已完成 member
+    - flush_every: 每处理 N 个 member 落盘一次进度
+    - reset_progress: True 时忽略并覆盖旧进度
+
+    - list_file: 如果提供则使用该文件，否则使用 config.followedArtistListFile
+    - hide: 同 process_bookmark，n=public, o=private, other=both
+    - delay_seconds: 每个请求后的等待秒数，避免被封（可通过 config.preheatDelaySeconds 或 config.preheatDelay 覆盖）
+    """
+    br: PixivBrowser = caller.__br__
+    db = caller.__dbManager__
+
+    # allow config override and enforce a sensible minimum (0.1s)
+    cfg_delay = None
+    try:
+        cfg_delay = getattr(config, 'preheatDelaySeconds', None)
+        if cfg_delay is None:
+            cfg_delay = getattr(config, 'preheatDelay', None)
+        if cfg_delay is not None:
+            delay_seconds = float(cfg_delay)
+            if delay_seconds < 0.1:
+                delay_seconds = 0.1
+    except Exception:
+        # keep provided delay_seconds on any error
+        pass
+
+    if list_file is None:
+        list_file = getattr(config, 'followedArtistListFile', 'followed_artists.txt')
+
+    if progress_file is None:
+        progress_file = f"{list_file}.preheat_progress.json" if list_file else 'preheat_progress.json'
+
+    total_list = list()
+    use_local = getattr(config, 'useLocalFollowedArtistList', True)
+
+    try:
+        if use_local and list_file and os.path.exists(list_file) and os.path.getsize(list_file) > 0:
+            PixivHelper.print_and_log('info', f"Preheat: Using local followed artist list: {list_file}")
+            total_list = PixivListItem.parseList(list_file, config.rootDirectory)
+        else:
+            PixivHelper.print_and_log('info', f"Preheat: Local list not found or empty, fetching online.")
+            if hide != 'o':
+                total_list.extend(get_bookmarks(caller, config, False, 1, 0, br._myId))
+            if hide != 'n':
+                total_list.extend(get_bookmarks(caller, config, True, 1, 0, br._myId))
+
+            # persist for next runs
+            if use_local and list_file:
+                try:
+                    PixivBookmark.exportList(total_list, list_file)
+                    PixivHelper.print_and_log('info', f"Preheat: Wrote local followed artist list: {list_file}")
+                except Exception as ex:
+                    PixivHelper.print_and_log('warn', f"Preheat: Failed to write local list ({list_file}): {ex}")
+
+        total_list = _unique_by_member_id(total_list)
+
+        if len(total_list) == 0:
+            PixivHelper.print_and_log('info', 'Preheat: No members to process.')
+            return
+
+        progress = {} if reset_progress else _load_preheat_progress(progress_file)
+        done = set(str(x) for x in progress.get('done', [])) if resume else set()
+
+        PixivHelper.print_and_log('info', f"Preheat: progress_file={progress_file}, resume={resume}, done={len(done)}")
+        PixivHelper.print_and_log('info', f'Preheat: Processing {len(total_list)} members (delay={delay_seconds}s).')
+
+        processed_since_flush = 0
+        i = 0
+        for item in total_list:
+            i += 1
+            member_id = str(item.memberId)
+
+            if resume and member_id in done:
+                continue
+
+            PixivHelper.print_and_log('info', f'Preheat: ({i}/{len(total_list)}) Fetching profile for member {member_id}')
+            try:
+                (artist, _) = br.getMemberPage(member_id, 1, False, None, r18mode=config.r18mode, throw_empty_error=True)
+                if hasattr(artist, 'totalImages') and artist.totalImages is not None:
+                    try:
+                        db.updateMemberTotalImages(int(member_id), int(artist.totalImages))
+                        PixivHelper.print_and_log('info', f'Preheat: Updated member {member_id} total_images={artist.totalImages}')
+                    except Exception:
+                        PixivHelper.print_and_log('warn', f'Preheat: Failed to update DB for member {member_id}')
+                else:
+                    PixivHelper.print_and_log('warn', f'Preheat: member {member_id} returned no totalImages')
+
+                done.add(member_id)
+                processed_since_flush += 1
+
+                if flush_every and processed_since_flush >= int(flush_every):
+                    progress = {
+                        'done': sorted(done),
+                        'updated_at': PixivHelper.get_current_date_time() if hasattr(PixivHelper, 'get_current_date_time') else None,
+                        'list_file': list_file,
+                        'total': len(total_list)
+                    }
+                    _save_preheat_progress(progress_file, progress)
+                    processed_since_flush = 0
+
+            except PixivException as ex:
+                PixivHelper.print_and_log('warn', f'Preheat: PixivException for member {member_id}: {ex}')
+                # 仍然记录为 done，避免卡在同一个异常账号
+                done.add(member_id)
+            except Exception as ex:
+                PixivHelper.print_and_log('warn', f'Preheat: Error fetching member {member_id}: {ex}')
+                # 不标 done，便于下次重试
+                pass
+
+            PixivHelper.print_delay(delay_seconds)
+
+        # final flush
+        progress = {
+            'done': sorted(done),
+            'updated_at': PixivHelper.get_current_date_time() if hasattr(PixivHelper, 'get_current_date_time') else None,
+            'list_file': list_file,
+            'total': len(total_list)
+        }
+        _save_preheat_progress(progress_file, progress)
+
+        PixivHelper.print_and_log('info', 'Preheat: Done.')
+    except KeyboardInterrupt:
+        # flush on Ctrl-C so resume works
+        try:
+            progress = {
+                'done': sorted(set(str(x) for x in done)),
+                'updated_at': PixivHelper.get_current_date_time() if hasattr(PixivHelper, 'get_current_date_time') else None,
+                'list_file': list_file,
+                'total': len(total_list)
+            }
+            _save_preheat_progress(progress_file, progress)
+            PixivHelper.print_and_log('info', f'Preheat: Saved progress to {progress_file} (KeyboardInterrupt).')
+        except Exception:
+            pass
+        raise
+    except BaseException:
+        PixivHelper.print_and_log('error', f'Preheat: Error at preheat_followed_members(): {sys.exc_info()}')
+        raise
+
+
+def scan_and_mark_completed_members(caller, config, list_file=None, progress_file=None, compare_remote=True, dry_run=True, download_missing=False, download_limit=None):
+    """Scan local DB/files for followed members and mark those that appear complete.
+
+    - list_file: followed list file (default config.followedArtistListFile)
+    - progress_file: file to write completed member ids (default: <list_file>.preheat_progress.json)
+    - compare_remote: if True, fetch remote member image list to determine exact remote set
+    - dry_run: if True, do not write changes, only print a summary
+    - download_missing: if True, attempt to download missing images (only missing ones)
+    - download_limit: optional int to limit number of images to download per member for safety
+    """
+    br: PixivBrowser = caller.__br__
+    db = caller.__dbManager__
+
+    if list_file is None:
+        list_file = getattr(config, 'followedArtistListFile', 'followed_artists.txt')
+    if progress_file is None:
+        progress_file = f"{list_file}.preheat_progress.json" if list_file else 'preheat_progress.json'
+
+    use_local = getattr(config, 'useLocalFollowedArtistList', True)
+
+    # load members
+    total_list = list()
+    try:
+        if use_local and list_file and os.path.exists(list_file) and os.path.getsize(list_file) > 0:
+            PixivHelper.print_and_log('info', f"Scan: Using local followed artist list: {list_file}")
+            total_list = PixivListItem.parseList(list_file, config.rootDirectory)
+        else:
+            PixivHelper.print_and_log('info', "Scan: Local list not found or empty, fetching online.")
+            total_list.extend(get_bookmarks(caller, config, False, 1, 0, br._myId))
+            total_list.extend(get_bookmarks(caller, config, True, 1, 0, br._myId))
+            # optionally persist for next runs
+            if use_local and list_file:
+                try:
+                    PixivBookmark.exportList(total_list, list_file)
+                except Exception:
+                    pass
+
+        total_list = _unique_by_member_id(total_list)
+        if len(total_list) == 0:
+            PixivHelper.print_and_log('info', 'Scan: No members to process.')
+            return
+
+        member_ids = [int(x.memberId) for x in total_list if getattr(x, 'memberId', None) is not None]
+
+        # load total_images from DB
+        total_map = {}
+        try:
+            if hasattr(db, 'selectMemberTotalImagesMap'):
+                total_map = db.selectMemberTotalImagesMap(member_ids)
+        except Exception as ex:
+            PixivHelper.print_and_log('warn', f'Scan: failed to load total_images from DB: {ex}')
+            total_map = {}
+
+        # load existing progress
+        progress = _load_preheat_progress(progress_file) or {}
+        done_set = set(str(x) for x in progress.get('done', []))
+
+        newly_marked = []
+        checked = 0
+        total_missing_to_download = 0
+
+        for item in total_list:
+            mid = str(item.memberId)
+            if mid in done_set:
+                continue
+            checked += 1
+
+            # 1) build db set (images known as downloaded in DB and actually present)
+            db_image_ids = set()
+            try:
+                rows = db.selectImageByMemberId(int(mid)) or []
+                for r in rows:
+                    try:
+                        image_id = int(r[0])
+                        save_name = r[3] if len(r) > 3 else None
+                        if save_name and save_name != 'N/A' and db.cleanupFileExists(save_name):
+                            db_image_ids.add(image_id)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # 2) build local set by inspecting member save_folder or nearby folders
+            local_image_ids = set()
+            try:
+                save_folder = None
+                try:
+                    row = db.selectMemberByMemberId(int(mid))
+                    if row is not None and len(row) > 2 and row[2]:
+                        save_folder = row[2]
+                except Exception:
+                    save_folder = None
+
+                candidate_dirs = []
+                if save_folder:
+                    candidate_dirs.append(os.path.join(config.rootDirectory, save_folder))
+                # also try common patterns
+                candidate_dirs.append(os.path.join(config.rootDirectory, mid))
+
+                # search limited depth for directories containing member id prefix
+                if not save_folder and os.path.isdir(config.rootDirectory):
+                    for name in os.listdir(config.rootDirectory):
+                        if name.startswith(str(mid)) or name.find(f"{mid} ") >= 0 or name.find(f" {mid}") >= 0:
+                            candidate_dirs.append(os.path.join(config.rootDirectory, name))
+
+                for d in candidate_dirs:
+                    if d and os.path.isdir(d):
+                        try:
+                            for fname in os.listdir(d):
+                                if fname.startswith('.'):
+                                    continue
+                                # extract first numeric token of 6+ digits as image id (heuristic)
+                                nums = re.findall(r"(\d{6,9})", fname)
+                                for n in nums:
+                                    try:
+                                        local_image_ids.add(int(n))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # union of known local sources
+            present_ids = set()
+            present_ids.update(db_image_ids)
+            present_ids.update(local_image_ids)
+
+            # 3) get remote image id list (exact)
+            remote_ids = set()
+            remote_total = total_map.get(int(mid)) if total_map is not None else None
+            if compare_remote:
+                try:
+                    page = 1
+                    while True:
+                        (artist, _) = br.getMemberPage(int(mid), page, False, None, r18mode=config.r18mode, throw_empty_error=False)
+                        if artist is None:
+                            break
+                        if getattr(artist, 'imageList', None):
+                            for iid in artist.imageList:
+                                try:
+                                    remote_ids.add(int(iid))
+                                except Exception:
+                                    pass
+                        # update remote_total if available
+                        if getattr(artist, 'totalImages', None) is not None:
+                            remote_total = int(artist.totalImages)
+                        if getattr(artist, 'isLastPage', False):
+                            break
+                        page += 1
+                        # small delay between profile requests
+                        PixivHelper.print_delay(getattr(config, 'preheatDelaySeconds', getattr(config, 'preheatDelay', 0.5)))
+                except Exception as ex:
+                    PixivHelper.print_and_log('warn', f'Scan: failed to fetch remote images for {mid}: {ex}')
+
+            # fallback: if remote_total known and no remote_ids (e.g., failed), just use count
+            if not remote_ids and remote_total is not None:
+                # we cannot know ids, only counts — treat as conservative
+                try:
+                    remote_total = int(remote_total)
+                except Exception:
+                    remote_total = None
+
+            # compute missing set at image level
+            missing_ids = set()
+            if remote_ids:
+                missing_ids = remote_ids - present_ids
+            elif remote_total is not None:
+                # if we only know counts, mark missing if db/local count < remote_total
+                if len(present_ids) < remote_total:
+                    PixivHelper.print_and_log('info', f'Scan: Member {mid} has less files ({len(present_ids)}) than remote total ({remote_total}), but remote IDs unavailable.')
+                    # cannot download specific missing ids without remote list
+                else:
+                    # counts match
+                    pass
+
+            if missing_ids:
+                PixivHelper.print_and_log('info', f'Scan: Member {mid} missing {len(missing_ids)} images.')
+            else:
+                PixivHelper.print_and_log('info', f'Scan: Member {mid} no missing images detected (local={len(present_ids)}, remote={len(remote_ids) if remote_ids else remote_total}).')
+
+            # optionally download missing images
+            downloaded_count = 0
+            if download_missing and missing_ids:
+                for iid in sorted(missing_ids):
+                    if download_limit is not None and downloaded_count >= download_limit:
+                        PixivHelper.print_and_log('info', f'Scan: download limit reached for member {mid}.')
+                        break
+                    PixivHelper.print_and_log('info', f'Scan: Downloading missing image {iid} for member {mid}...')
+                    try:
+                        # process_image will insert/update DB on success
+                        result = PixivImageHandler.process_image(caller, config, artist=None, image_id=int(iid), user_dir='')
+                        PixivHelper.wait(result, config)
+                        if result == PixivConstant.PIXIVUTIL_OK:
+                            downloaded_count += 1
+                            total_missing_to_download += 1
+                            # refresh present_ids by checking DB
+                            try:
+                                r = db.selectImageByImageId(iid, cols='save_name')
+                                if r is not None and db.cleanupFileExists(r[0]):
+                                    present_ids.add(int(iid))
+                            except Exception:
+                                pass
+                        else:
+                            PixivHelper.print_and_log('warn', f'Scan: Download of image {iid} returned result {result}.')
+                    except Exception as ex:
+                        PixivHelper.print_and_log('warn', f'Scan: Failed downloading image {iid} for member {mid}: {ex}')
+                    # small delay between downloads to be polite
+                    PixivHelper.print_delay(getattr(config, 'preheatDelaySeconds', getattr(config, 'preheatDelay', 0.5)))
+
+            # decide completion only when remote_ids known and present_ids covers them
+            is_complete = False
+            if remote_ids:
+                if remote_ids.issubset(present_ids):
+                    is_complete = True
+            elif remote_total is not None:
+                if len(present_ids) >= remote_total:
+                    is_complete = True
+            else:
+                # fallback: conservative folder check
+                if len(present_ids) > 0:
+                    try:
+                        folder_ok = False
+                        if save_folder:
+                            dirpath = os.path.join(config.rootDirectory, save_folder)
+                            if os.path.isdir(dirpath):
+                                cnt = len([n for n in os.listdir(dirpath) if not n.startswith('.')])
+                                if cnt >= len(present_ids):
+                                    folder_ok = True
+                        if folder_ok:
+                            is_complete = True
+                    except Exception:
+                        is_complete = False
+
+            if is_complete:
+                PixivHelper.print_and_log('info', f'Scan: Member {mid} appears complete (present={len(present_ids)}, remote={len(remote_ids) if remote_ids else remote_total}).')
+                newly_marked.append(mid)
+                done_set.add(mid)
+            else:
+                PixivHelper.print_and_log('info', f'Scan: Member {mid} incomplete (present={len(present_ids)}, missing={len(missing_ids)}).')
+
+        # summary
+        PixivHelper.print_and_log('info', f"Scan: Checked {checked} members, newly marked {len(newly_marked)} members as complete. Downloaded {total_missing_to_download} missing images.")
+
+        if dry_run:
+            PixivHelper.print_and_log('info', 'Scan: Dry run enabled, not saving progress file.')
+            return
+
+        # persist progress
+        progress_out = {
+            'done': sorted(set(str(x) for x in done_set)),
+            'updated_at': PixivHelper.get_current_date_time() if hasattr(PixivHelper, 'get_current_date_time') else None,
+            'list_file': list_file,
+            'total': len(total_list)
+        }
+        _save_preheat_progress(progress_file, progress_out)
+        PixivHelper.print_and_log('info', f'Scan: Saved progress to {progress_file}.')
+
+    except KeyboardInterrupt:
+        PixivHelper.print_and_log('info', 'Scan: Interrupted by user.')
+        raise
+    except Exception as ex:
+        PixivHelper.print_and_log('error', f'Scan: Error at scan_and_mark_completed_members(): {ex}')
+        raise
+
+
+def _is_member_complete_via_db(caller, config, member_id, skip_local_scan=False, compare_remote=False):
+    """
+    检查一个作者是否已完成下载。
+    - skip_local_scan=True: 跳过本地扫盘，只用DB文件列表
+    - compare_remote=True: 与云端对比
+    返回: (is_complete, present_ids_count, remote_ids_count)
+    """
+    db = caller.__dbManager__
+    br = caller.__br__
+    
+    # 1) build db set (images in DB and file exists)
+    db_image_ids = set()
+    try:
+        rows = db.selectImageByMemberId(int(member_id)) or []
+        for r in rows:
+            try:
+                image_id = int(r[0])
+                save_name = r[3] if len(r) > 3 else None
+                if save_name and save_name != 'N/A' and db.cleanupFileExists(save_name):
+                    db_image_ids.add(image_id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    
+    # 2) build local set (only if not skipping)
+    local_image_ids = set()
+    if not skip_local_scan:
+        try:
+            save_folder = None
+            try:
+                row = db.selectMemberByMemberId(int(member_id))
+                if row is not None and len(row) > 2 and row[2]:
+                    save_folder = row[2]
+            except Exception:
+                save_folder = None
+
+            candidate_dirs = []
+            if save_folder:
+                candidate_dirs.append(os.path.join(config.rootDirectory, save_folder))
+            candidate_dirs.append(os.path.join(config.rootDirectory, str(member_id)))
+
+            # search limited depth for directories containing member id prefix
+            if not save_folder and os.path.isdir(config.rootDirectory):
+                for name in os.listdir(config.rootDirectory):
+                    if name.startswith(str(member_id)) or name.find(f"{member_id} ") >= 0 or name.find(f" {member_id}") >= 0:
+                        candidate_dirs.append(os.path.join(config.rootDirectory, name))
+
+            for d in candidate_dirs:
+                if d and os.path.isdir(d):
+                    try:
+                        for fname in os.listdir(d):
+                            if fname.startswith('.'):
+                                continue
+                            nums = re.findall(r"(\d{6,9})", fname)
+                            for n in nums:
+                                try:
+                                    local_image_ids.add(int(n))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    
+    # union of known local sources
+    present_ids = set()
+    present_ids.update(db_image_ids)
+    present_ids.update(local_image_ids)
+    
+    # 3) get remote image id list
+    remote_ids = set()
+    remote_total = None
+    if compare_remote:
+        try:
+            page = 1
+            while True:
+                (artist, _) = br.getMemberPage(int(member_id), page, False, None, r18mode=config.r18mode, throw_empty_error=False)
+                if artist is None:
+                    break
+                if getattr(artist, 'imageList', None):
+                    for iid in artist.imageList:
+                        try:
+                            remote_ids.add(int(iid))
+                        except Exception:
+                            pass
+                if getattr(artist, 'totalImages', None) is not None:
+                    remote_total = int(artist.totalImages)
+                if getattr(artist, 'isLastPage', False):
+                    break
+                page += 1
+                PixivHelper.print_delay(getattr(config, 'preheatDelaySeconds', getattr(config, 'preheatDelay', 0.5)))
+        except Exception:
+            pass
+    
+    # decide completion
+    is_complete = False
+    if compare_remote and remote_ids:
+        is_complete = remote_ids.issubset(present_ids)
+    elif not compare_remote and len(present_ids) > 0:
+        # without remote comparison, assume complete if we have some local/db files
+        # this is conservative: only mark if we're confident
+        try:
+            row = db.selectMemberByMemberId(int(member_id))
+            if row is not None and len(row) > 5:
+                total_images_in_db = row[5]  # column for total_images
+                if total_images_in_db and int(total_images_in_db) > 0:
+                    if len(present_ids) >= int(total_images_in_db):
+                        is_complete = True
+        except Exception:
+            pass
+    
+    return (is_complete, len(present_ids), len(remote_ids) if remote_ids else remote_total)
+
+
+def _update_mark_progress_for_member(caller, config, member_id, progress_data, is_complete):
+    """
+    更新该成员的标记状态。
+    """
+    mid = str(member_id)
+    if is_complete:
+        if mid not in progress_data.get('done', []):
+            progress_data['done'].append(mid)
+            progress_data['done'] = sorted(set(str(x) for x in progress_data['done']))
+            progress_data['updated_at'] = PixivHelper.get_current_date_time() if hasattr(PixivHelper, 'get_current_date_time') else None
+            return True
+    return False
+
+
+def _auto_mark_completed_members_after_download(caller, config, total_list, progress_file=None):
+    """
+    下载完成后自动标记已完成的作者。
+    在菜单5循环中调用，用于增量更新进度文件。
+    
+    - progress_file: JSON进度文件路径
+    - 使用config.menu5SkipLocalScan和config.menu5CompareRemote配置
+    """
+    if not getattr(config, 'menu5EnableAutoMark', True):
+        return
+    
+    if progress_file is None:
+        progress_file = getattr(config, 'menu5MarkProgressFile', 'preheat_progress.json')
+    
+    if not progress_file:
+        return
+    
+    skip_local = getattr(config, 'menu5SkipLocalScan', False)
+    compare_remote = getattr(config, 'menu5CompareRemote', False)
+    
+    # load existing progress
+    progress_data = _load_preheat_progress(progress_file) or {'done': []}
+    if 'done' not in progress_data:
+        progress_data['done'] = []
+    
+    marked_count = 0
+    for item in total_list:
+        mid = str(item.memberId)
+        
+        # skip if already marked
+        if mid in progress_data.get('done', []):
+            continue
+        
+        # check if complete
+        (is_complete, present_cnt, remote_cnt) = _is_member_complete_via_db(caller, config, mid, skip_local_scan=skip_local, compare_remote=compare_remote)
+        
+        # update progress
+        if _update_mark_progress_for_member(caller, config, mid, progress_data, is_complete):
+            PixivHelper.print_and_log('info', f'Auto-marked member {mid} as complete (present={present_cnt}, remote={remote_cnt}).')
+            marked_count += 1
+    
+    # save progress
+    if marked_count > 0:
+        try:
+            _save_preheat_progress(progress_file, progress_data)
+            PixivHelper.print_and_log('info', f'Auto-mark: Saved {marked_count} newly marked members to {progress_file}.')
+        except Exception as ex:
+            PixivHelper.print_and_log('warn', f'Auto-mark: Failed to save progress: {ex}')
