@@ -20,6 +20,11 @@ config.ini
 config.ini.error*
 # Log files
 *.log*
+# User data
+followed_artists.txt*
+content_provider.json
+# Lock files
+uv.lock
 list.txt
 *.log
 *.bat
