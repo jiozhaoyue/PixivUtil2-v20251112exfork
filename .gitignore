@@ -18,6 +18,8 @@ dist*/*
 old/*
 config.ini
 config.ini.error*
+# Log files
+*.log*
 list.txt
 *.log
 *.bat
