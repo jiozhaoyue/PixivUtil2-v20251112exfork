@@ -769,6 +769,20 @@ class PixivDBManager(object):
         except BaseException:
             PixivHelper.print_and_log('warn', f"Error at updateMemberTotalImages(): {sys.exc_info()}")
 
+    def setIsDeletedFlagForMemberId(self, memberId):
+        """Set the is_deleted flag for a member."""
+        try:
+            c = self.conn.cursor()
+            c.execute(
+                """UPDATE pixiv_master_member
+                   SET is_deleted = 1
+                   WHERE member_id = ?""",
+                (int(memberId),),
+            )
+            self.conn.commit()
+        except BaseException:
+            PixivHelper.print_and_log('warn', f"Error at setIsDeletedFlagForMemberId(): {sys.exc_info()}")
+
     def selectMemberTotalImagesMap(self, member_ids=None):
         """Return {member_id(str): total_images(int)} for members with total_images not null.
 
